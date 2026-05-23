@@ -522,6 +522,229 @@ def fetch_option_anomalies(ticker, threshold, tg_token, tg_chat_id):
     return alerts_found
 
 # ─────────────────────────────────────────
+# AUTO ANALYSIS FUNCTIONS
+# ─────────────────────────────────────────
+
+def auto_analyze(alerts):
+    """
+    根據警報數據自動生成中文分析摘要
+    """
+    if not alerts:
+        return None
+
+    valid = [a for a in alerts if "error" not in a]
+    if not valid:
+        return None
+
+    is_afterhours = valid[0].get("mode") == "afterhours"
+
+    # 統計
+    bull_alerts = [a for a in valid if a["sentiment"] == "bull"]
+    bear_alerts = [a for a in valid if a["sentiment"] == "bear"]
+    neutral_alerts = [a for a in valid if a["sentiment"] == "neutral"]
+
+    # 按股票分組
+    ticker_groups = {}
+    for a in valid:
+        t = a["ticker"]
+        if t not in ticker_groups:
+            ticker_groups[t] = {"bull": [], "bear": [], "neutral": []}
+        ticker_groups[t][a["sentiment"]].append(a)
+
+    lines = []
+
+    # ── 整體傾向 ──
+    total = len(valid)
+    bull_pct = len(bull_alerts) / total * 100
+    bear_pct = len(bear_alerts) / total * 100
+
+    if bull_pct >= 70:
+        overall = "🟢 整體明顯偏多"
+        overall_detail = f"看多信號佔 {bull_pct:.0f}%，市場情緒積極。"
+    elif bear_pct >= 70:
+        overall = "🔴 整體明顯偏空"
+        overall_detail = f"看空信號佔 {bear_pct:.0f}%，市場情緒謹慎。"
+    elif bull_pct > bear_pct:
+        overall = "🟡 整體略偏多"
+        overall_detail = f"看多 {len(bull_alerts)} 個 vs 看空 {len(bear_alerts)} 個，多方略佔優。"
+    elif bear_pct > bull_pct:
+        overall = "🟡 整體略偏空"
+        overall_detail = f"看空 {len(bear_alerts)} 個 vs 看多 {len(bull_alerts)} 個，空方略佔優。"
+    else:
+        overall = "⚪ 多空均衡"
+        overall_detail = "看多看空信號數量相近，市場方向不明確。"
+
+    lines.append(("overall", overall, overall_detail))
+
+    # ── 逐股分析 ──
+    stock_analysis = []
+    for ticker, groups in ticker_groups.items():
+        bull_n = len(groups["bull"])
+        bear_n = len(groups["bear"])
+        all_ticker = groups["bull"] + groups["bear"] + groups["neutral"]
+
+        # 最大成交量合約
+        top = max(all_ticker, key=lambda x: x["volume"]) if all_ticker else None
+
+        if bull_n > bear_n:
+            direction = "偏多"
+            dir_color = "bull"
+        elif bear_n > bull_n:
+            direction = "偏空"
+            dir_color = "bear"
+        else:
+            direction = "中性"
+            dir_color = "neutral"
+
+        # Vol/OI 或倍數解讀
+        if top:
+            voi = top.get("vol_ratio", 0)
+            iv = top.get("iv", 0)
+            strike = top.get("strike", 0)
+            opt_type = top.get("opt_type", "call").upper()
+            expiry = top.get("expiry", "")
+            vol = top.get("volume", 0)
+
+            if is_afterhours:
+                strength = "極強" if voi > 10 else ("強" if voi > 5 else ("中等" if voi > 2 else "一般"))
+                key_info = f"最活躍合約：{opt_type} ${strike}（到期 {expiry}），全日成交 {format_volume(vol)} 張，Vol/OI={voi:.2f}（新開倉{strength}）"
+            else:
+                strength = "極強" if voi > 7 else ("強" if voi > 4 else ("中等" if voi > 2 else "一般"))
+                key_info = f"最強異動：{opt_type} ${strike}（到期 {expiry}），成交量突增 {voi:.1f} 倍（{strength}信號）"
+
+            # IV解讀
+            if iv > 80:
+                iv_comment = f"IV {iv:.0f}% 極高，市場預期短期大幅波動。"
+            elif iv > 50:
+                iv_comment = f"IV {iv:.0f}% 偏高，市場有一定不確定性。"
+            elif iv > 30:
+                iv_comment = f"IV {iv:.0f}% 正常水平。"
+            else:
+                iv_comment = f"IV {iv:.0f}% 偏低，市場情緒平穩。"
+
+            stock_analysis.append({
+                "ticker": ticker,
+                "direction": direction,
+                "dir_color": dir_color,
+                "bull_n": bull_n,
+                "bear_n": bear_n,
+                "key_info": key_info,
+                "iv_comment": iv_comment,
+                "top_vol": vol
+            })
+
+    stock_analysis.sort(key=lambda x: x["top_vol"], reverse=True)
+
+    # ── 隔日展望（收市後模式）──
+    if is_afterhours:
+        if bull_pct >= 60:
+            outlook = "收市前大量資金集中在Call端，隔日開盤若配合大盤走強，有機會延續升勢。留意阻力位附近是否出現反向信號。"
+        elif bear_pct >= 60:
+            outlook = "收市前大量資金集中在Put端，隔日開盤需注意下行風險，建議觀察開盤前15分鐘走勢確認方向。"
+        else:
+            outlook = "多空信號混雜，隔日方向不明確。建議等待開盤後量價確認再入場，避免倉促建倉。"
+    else:
+        if bull_pct >= 60:
+            outlook = "短線多方信號強烈，但需注意期權異動可能包含對沖成分，配合技術面確認再行動。"
+        elif bear_pct >= 60:
+            outlook = "短線空方信號明顯，留意下行風險，可考慮收緊止損或減倉。"
+        else:
+            outlook = "信號混雜，建議觀望為主，等待更清晰的方向性異動出現。"
+
+    return {
+        "overall": overall,
+        "overall_detail": overall_detail,
+        "stock_analysis": stock_analysis,
+        "outlook": outlook,
+        "bull_n": len(bull_alerts),
+        "bear_n": len(bear_alerts),
+        "total": total,
+        "is_afterhours": is_afterhours
+    }
+
+
+def generate_ai_prompt(alerts, analysis):
+    """
+    生成可複製到任何AI的分析Prompt
+    """
+    if not alerts or not analysis:
+        return ""
+
+    valid = [a for a in alerts if "error" not in a]
+    is_afterhours = valid[0].get("mode") == "afterhours" if valid else False
+    mode_label = "收市後期權數據分析" if is_afterhours else "實時期權異動分析"
+    scan_time = valid[0].get("time", "") if valid else ""
+
+    # 整理數據
+    data_lines = []
+    for a in valid[:15]:  # 最多15條
+        opt = a.get("opt_type","").upper()
+        ticker = a.get("ticker","")
+        strike = a.get("strike","")
+        expiry = a.get("expiry","")
+        vol = format_volume(a.get("volume",0))
+        voi = a.get("vol_ratio",0)
+        oi = format_volume(a.get("oi",0))
+        iv = a.get("iv",0)
+        last = a.get("last_price",0)
+        signal = a.get("signal_label","")
+
+        if is_afterhours:
+            data_lines.append(f"- {ticker} {opt} ${strike} 到期{expiry}：全日成交{vol}張，Vol/OI={voi:.2f}，OI={oi}，最後${last:.2f}，IV={iv:.0f}%，信號={signal}")
+        else:
+            data_lines.append(f"- {ticker} {opt} ${strike} 到期{expiry}：成交量突增{voi:.1f}倍，OI={oi}，最後${last:.2f}，IV={iv:.0f}%，信號={signal}")
+
+    data_str = "\n".join(data_lines)
+    tickers = list(set(a.get("ticker","") for a in valid))
+    tickers_str = "、".join(tickers)
+    scan_date = get_us_time().strftime("%Y-%m-%d")
+
+    if is_afterhours:
+        context = f"以下是{scan_date} 美股收市後的期權數據（{mode_label}），掃描時間 {scan_time} ET。這些是按全日成交量排名的最活躍合約，反映機構當日的佈局方向。"
+        question = f"""請根據以上期權數據，幫我分析：
+
+1. **整體市場情緒**：從Call/Put的成交分佈，判斷機構對{tickers_str}的整體看法是偏多還是偏空？
+
+2. **重點合約解讀**：哪些合約的Vol/OI比值最值得關注？高Vol/OI代表大量新開倉，請重點分析這些合約的含義。
+
+3. **行使價分佈意義**：機構集中在哪個價位區間建倉？這對判斷支撐/阻力有何參考意義？
+
+4. **IV分析**：當前IV水平對比正常範圍是高還是低？這反映市場對短期波動的預期如何？
+
+5. **隔日交易建議**：基於以上期權異動，下一個交易日的方向傾向是什麼？有哪些需要特別留意的風險？
+
+請用簡潔的繁體中文回答，每個部分給出明確的判斷，避免含糊表述。"""
+    else:
+        context = f"以下是{scan_date} 美股交易時段的期權異動數據（{mode_label}），掃描時間 {scan_time} ET。這些合約的成交量出現異常突增，可能反映機構的短線方向性押注。"
+        question = f"""請根據以上期權異動數據，幫我分析：
+
+1. **異動性質判斷**：這些成交量突增屬於新開倉建倉，還是平倉離場？請結合OI數據判斷。
+
+2. **方向性信號**：Call/Put的異動分佈顯示市場短線傾向多方還是空方？信號強度如何？
+
+3. **機構意圖推測**：基於行使價選擇和到期日，這些異動更像是方向性押注、對沖現貨，還是其他策略？
+
+4. **IV異常分析**：哪些合約的IV特別值得關注？是否暗示市場預期某個催化劑事件？
+
+5. **短線交易建議**：基於以上異動，對{tickers_str}的短線操作有什麼具體建議？包括方向、潛在入場區間和風險提示。
+
+請用簡潔的繁體中文回答，給出明確判斷，不要過度保守。"""
+
+    prompt = f"""你是一位專業的美股期權分析師，擅長解讀期權異動背後的機構意圖。
+
+【數據背景】
+{context}
+
+【期權異動數據】
+{data_str}
+
+【分析請求】
+{question}"""
+
+    return prompt
+
+
+# ─────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────
 with st.sidebar:
@@ -789,6 +1012,87 @@ else:
             </div>
         </div>
         """, unsafe_allow_html=True)
+
+# ─── AUTO ANALYSIS SECTION ───
+if st.session_state.alerts:
+    valid_alerts = [a for a in st.session_state.alerts if "error" not in a]
+    if valid_alerts:
+        st.markdown("---")
+        st.markdown('<div class="section-title">🧠 自動分析</div>', unsafe_allow_html=True)
+
+        analysis = auto_analyze(valid_alerts)
+        if analysis:
+            # 整體傾向
+            overall_color = "#00ff88" if "多" in analysis["overall"] and "空" not in analysis["overall"] else ("#ff3355" if "空" in analysis["overall"] else "#ffcc00")
+            st.markdown(f"""
+            <div style="background:#11111a; border:1px solid #1e1e2e; border-radius:8px; padding:1.2rem 1.5rem; margin-bottom:1rem;">
+                <div style="font-family:monospace; font-size:0.7rem; color:#666688; letter-spacing:2px; margin-bottom:0.5rem;">整體市場情緒</div>
+                <div style="font-size:1.1rem; font-weight:700; color:{overall_color}; margin-bottom:0.3rem;">{analysis['overall']}</div>
+                <div style="font-size:0.85rem; color:#aaaacc;">{analysis['overall_detail']}</div>
+                <div style="display:flex; gap:1.5rem; margin-top:0.8rem;">
+                    <span style="font-family:monospace; font-size:0.75rem; color:#00ff88;">🟢 看多 {analysis['bull_n']} 個</span>
+                    <span style="font-family:monospace; font-size:0.75rem; color:#ff3355;">🔴 看空 {analysis['bear_n']} 個</span>
+                    <span style="font-family:monospace; font-size:0.75rem; color:#666688;">共 {analysis['total']} 個信號</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # 逐股分析
+            for sa in analysis["stock_analysis"]:
+                dir_color = "#00ff88" if sa["dir_color"] == "bull" else ("#ff3355" if sa["dir_color"] == "bear" else "#ffcc00")
+                border_color = "#00ff88" if sa["dir_color"] == "bull" else ("#ff3355" if sa["dir_color"] == "bear" else "#ffcc00")
+                st.markdown(f"""
+                <div style="background:#11111a; border:1px solid #1e1e2e; border-left:3px solid {border_color}; border-radius:4px; padding:1rem 1.2rem; margin-bottom:0.6rem;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
+                        <span style="font-family:monospace; font-weight:700; color:#c9a84c; font-size:0.9rem;">{sa['ticker']}</span>
+                        <span style="font-size:0.75rem; color:{dir_color}; font-weight:700;">{sa['direction']}</span>
+                    </div>
+                    <div style="font-size:0.82rem; color:#ccccee; margin-bottom:0.3rem;">📌 {sa['key_info']}</div>
+                    <div style="font-size:0.78rem; color:#888899;">📈 {sa['iv_comment']}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # 展望
+            mode_title = "📅 隔日展望" if analysis["is_afterhours"] else "⚡ 短線展望"
+            st.markdown(f"""
+            <div style="background:#0d0d18; border:1px solid #2a2a40; border-radius:8px; padding:1.2rem 1.5rem; margin-top:0.5rem;">
+                <div style="font-family:monospace; font-size:0.7rem; color:#666688; letter-spacing:2px; margin-bottom:0.5rem;">{mode_title}</div>
+                <div style="font-size:0.88rem; color:#ddddee; line-height:1.8;">{analysis['outlook']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # ─── AI PROMPT SECTION ───
+        st.markdown("---")
+        st.markdown('<div class="section-title">🤖 AI深度分析 Prompt</div>', unsafe_allow_html=True)
+        st.markdown("""
+        <div style="font-size:0.78rem; color:#666688; margin-bottom:0.8rem;">
+        複製以下Prompt，貼到 ChatGPT / Claude / Gemini，獲取更深入的AI分析。
+        </div>
+        """, unsafe_allow_html=True)
+
+        ai_prompt = generate_ai_prompt(valid_alerts, analysis)
+        if ai_prompt:
+            st.text_area(
+                label="AI分析Prompt（點擊全選→複製）",
+                value=ai_prompt,
+                height=280,
+                key="ai_prompt_box",
+                label_visibility="collapsed"
+            )
+            # 快捷連結
+            pc1, pc2, pc3 = st.columns(3)
+            with pc1:
+                st.link_button("🤖 開啟 ChatGPT", "https://chat.openai.com", use_container_width=True)
+            with pc2:
+                st.link_button("🧠 開啟 Claude", "https://claude.ai", use_container_width=True)
+            with pc3:
+                st.link_button("✨ 開啟 Gemini", "https://gemini.google.com", use_container_width=True)
+
+            st.markdown("""
+            <div style="font-size:0.7rem; color:#444466; margin-top:0.5rem; font-family:monospace;">
+            💡 提示：複製Prompt → 開啟AI → 貼上 → 發送。每次掃描後Prompt自動更新最新數據。
+            </div>
+            """, unsafe_allow_html=True)
 
 # ─── FOOTER ───
 st.markdown("---")
