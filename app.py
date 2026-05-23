@@ -236,6 +236,111 @@ def is_market_hours():
     market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
     return market_open <= now <= market_close
 
+def is_weekend():
+    return get_us_time().weekday() >= 5
+
+def get_session_label():
+    """返回當前時段標籤"""
+    now = get_us_time()
+    if is_market_hours():
+        return "LIVE", "🟢 美股交易時段"
+    elif now.weekday() >= 5:
+        return "WEEKEND", "🟡 週末 — 顯示上週五收市數據"
+    elif now.hour < 9 or (now.hour == 9 and now.minute < 30):
+        return "PRE", "🟡 盤前 — 顯示昨日收市數據"
+    else:
+        return "AFTER", "🟡 收市後 — 顯示今日完整期權數據"
+
+def fetch_afterhours_analysis(ticker, top_n=10):
+    """
+    收市後/非交易時段模式：
+    掃描最近交易日的完整期權數據，
+    按成交量絕對值排名，找出全日最大手的合約，
+    作為隔日方向參考。
+    """
+    results = []
+    try:
+        tk = yf.Ticker(ticker)
+        expirations = tk.options
+        if not expirations:
+            return results
+
+        # 14天內到期日
+        now = datetime.now()
+        cutoff = now + timedelta(days=14)
+        near_exps = [
+            e for e in expirations
+            if datetime.strptime(e, "%Y-%m-%d") <= cutoff
+        ]
+        if not near_exps:
+            near_exps = expirations[:1]
+
+        # 獲取股價
+        try:
+            current_price = tk.fast_info.last_price or tk.fast_info.previous_close
+        except Exception:
+            current_price = None
+
+        all_contracts = []
+
+        for exp in near_exps:
+            try:
+                chain = tk.option_chain(exp)
+                for opt_type, df in [("call", chain.calls), ("put", chain.puts)]:
+                    if df.empty:
+                        continue
+                    for _, row in df.iterrows():
+                        try:
+                            vol = int(row.get("volume", 0) or 0)
+                            oi = int(row.get("openInterest", 0) or 0)
+                            strike = float(row.get("strike", 0))
+                            last_price = float(row.get("lastPrice", 0) or 0)
+                            iv = float(row.get("impliedVolatility", 0) or 0) * 100
+
+                            # 行使價過濾 ±10%
+                            if current_price and current_price > 0:
+                                if not (current_price * 0.90 <= strike <= current_price * 1.10):
+                                    continue
+
+                            if vol < 100 or last_price < 0.05:
+                                continue
+
+                            # vol/oi 比值：越高代表新開倉比例越大
+                            vol_oi_ratio = (vol / oi) if oi > 0 else 0
+                            oi_change_pct = vol_oi_ratio * 100
+                            signal_label, sentiment = determine_signal(opt_type, vol_oi_ratio, oi_change_pct)
+
+                            all_contracts.append({
+                                "ticker": ticker,
+                                "expiry": exp,
+                                "opt_type": opt_type,
+                                "strike": strike,
+                                "volume": vol,
+                                "baseline": oi,
+                                "vol_ratio": vol_oi_ratio,
+                                "oi": oi,
+                                "last_price": last_price,
+                                "iv": iv,
+                                "signal_label": signal_label,
+                                "sentiment": sentiment,
+                                "time": get_us_time().strftime("%H:%M:%S"),
+                                "timestamp": time.time(),
+                                "mode": "afterhours"  # 標記為收市後分析
+                            })
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+
+        # 按成交量排序，取Top N
+        all_contracts.sort(key=lambda x: x["volume"], reverse=True)
+        results = all_contracts[:top_n]
+
+    except Exception:
+        pass
+
+    return results
+
 def format_volume(v):
     if v >= 1_000_000:
         return f"{v/1_000_000:.1f}M"
@@ -281,13 +386,18 @@ def send_telegram(token, chat_id, message):
 
 def build_telegram_message(alert):
     signal_emoji = "🟢" if alert["sentiment"] == "bull" else ("🔴" if alert["sentiment"] == "bear" else "🟡")
+    mode = alert.get("mode", "live")
+    mode_label = "📊 收市後分析 — 隔日參考" if mode == "afterhours" else "⚡ 實時異動"
+    vol_label = "全日成交量" if mode == "afterhours" else "成交量"
+    ratio_label = "Vol/OI" if mode == "afterhours" else f"基準×{alert['vol_ratio']:.1f}倍"
+
     msg = f"""
-{signal_emoji} <b>期權異動警報</b>
+{signal_emoji} <b>期權異動警報</b> | {mode_label}
 
 📌 <b>{alert['ticker']}</b> | {alert['opt_type'].upper()} ${alert['strike']} | 到期：{alert['expiry']}
 📊 信號：{alert['signal_label']}
 
-成交量：<b>{format_volume(alert['volume'])}</b>（基準 {format_volume(alert['baseline'])} × {alert['vol_ratio']:.1f}倍）
+{vol_label}：<b>{format_volume(alert['volume'])}</b>（{ratio_label}）
 未平倉：{format_volume(alert['oi'])}
 最後價：${alert['last_price']:.2f}
 IV：{alert['iv']:.1f}%
@@ -442,6 +552,15 @@ with st.sidebar:
         step=30
     )
 
+    afterhours_top_n = st.slider(
+        "收市後顯示Top N合約",
+        min_value=5,
+        max_value=30,
+        value=10,
+        step=5,
+        help="非交易時段按全日成交量排名，顯示前N個最活躍合約"
+    )
+
     st.markdown('<div class="section-title">Telegram 設定</div>', unsafe_allow_html=True)
 
     tg_token = st.text_input(
@@ -540,26 +659,56 @@ st.markdown("")
 
 # ─── SCANNING LOGIC ───
 if st.session_state.monitoring:
-    if not is_market_hours():
-        st.warning("⚠️ 現在非美股交易時段（ET 09:30-16:00），數據可能不更新。監控仍運行中。")
+    session_code, session_label = get_session_label()
 
-    with st.spinner(f"🔍 掃描中... {', '.join(tickers_list)}"):
-        new_alerts = []
-        for ticker in tickers_list:
-            found = fetch_option_anomalies(ticker, threshold, tg_token, tg_chat_id)
-            new_alerts.extend(found)
+    if session_code == "LIVE":
+        # ══ 實時模式 ══
+        st.markdown(f'<p style="font-size:0.78rem; color:#00ff88; font-family:monospace;">● {session_label}</p>', unsafe_allow_html=True)
 
-        st.session_state.scan_count += 1
-        st.session_state.last_scan = get_us_time().strftime("%H:%M:%S ET")
+        with st.spinner(f"🔍 實時掃描中... {', '.join(tickers_list)}"):
+            new_alerts = []
+            for ticker in tickers_list:
+                found = fetch_option_anomalies(ticker, threshold, tg_token, tg_chat_id)
+                new_alerts.extend(found)
 
-        if new_alerts:
-            st.session_state.alerts = new_alerts + st.session_state.alerts
-            # 只保留最新100條
-            st.session_state.alerts = st.session_state.alerts[:100]
+            st.session_state.scan_count += 1
+            st.session_state.last_scan = get_us_time().strftime("%H:%M:%S ET")
 
-    # Auto-refresh
-    time.sleep(scan_interval)
-    st.rerun()
+            if new_alerts:
+                st.session_state.alerts = new_alerts + st.session_state.alerts
+                st.session_state.alerts = st.session_state.alerts[:100]
+
+        time.sleep(scan_interval)
+        st.rerun()
+
+    else:
+        # ══ 收市後/盤前/週末模式 ══
+        st.markdown(f'<p style="font-size:0.78rem; color:#ffcc00; font-family:monospace;">● {session_label}</p>', unsafe_allow_html=True)
+
+        st.info("📊 **收市後分析模式** — 掃描最近交易日完整期權數據，按全日成交量排名，供判斷下一個交易日趨勢參考。")
+
+        # 只掃一次（收市後數據不會再變，無需輪詢）
+        if st.session_state.scan_count == 0 or st.button("🔄 重新掃描", key="rescan_ah"):
+            with st.spinner(f"📊 分析最近交易日數據... {', '.join(tickers_list)}"):
+                ah_alerts = []
+                for ticker in tickers_list:
+                    found = fetch_afterhours_analysis(ticker, top_n=afterhours_top_n)
+                    # 推送Top 3到Telegram（避免洗版）
+                    for i, alert in enumerate(found[:3]):
+                        ah_key = f"ah_{alert['ticker']}_{alert['expiry']}_{alert['opt_type']}_{alert['strike']}"
+                        if ah_key not in st.session_state.sent_hashes:
+                            st.session_state.sent_hashes.add(ah_key)
+                            if tg_token and tg_chat_id:
+                                msg = build_telegram_message(alert)
+                                send_telegram(tg_token, tg_chat_id, msg)
+                    ah_alerts.extend(found)
+
+                st.session_state.scan_count += 1
+                st.session_state.last_scan = get_us_time().strftime("%H:%M:%S ET")
+
+                if ah_alerts:
+                    # 收市後模式：直接替換（非累加）
+                    st.session_state.alerts = ah_alerts
 
 # ─── ALERT FEED ───
 st.markdown('<div class="section-title">異動警報 Feed</div>', unsafe_allow_html=True)
@@ -592,6 +741,7 @@ else:
             continue
 
         sentiment = alert.get("sentiment", "neutral")
+        is_afterhours = alert.get("mode") == "afterhours"
 
         # Apply filter
         if filter_sentiment == "🟢 看多" and sentiment != "bull":
@@ -608,6 +758,14 @@ else:
         opt_label = "CALL" if alert.get("opt_type") == "call" else "PUT"
         opt_color = "#00ff88" if alert.get("opt_type") == "call" else "#ff3355"
 
+        # 收市後模式：顯示Vol/OI比值；實時模式：顯示基準倍數
+        if is_afterhours:
+            ratio_html = f'Vol/OI <b style="color:#ffcc00">{alert.get("vol_ratio",0):.2f}</b>'
+            mode_badge = '<span style="font-size:0.65rem; color:#ffcc00; font-family:monospace; margin-left:6px;">📊 隔日參考</span>'
+        else:
+            ratio_html = f'基準×<b style="color:#ffcc00">{alert.get("vol_ratio",0):.1f}</b>倍'
+            mode_badge = '<span style="font-size:0.65rem; color:#00ff88; font-family:monospace; margin-left:6px;">⚡ 實時</span>'
+
         st.markdown(f"""
         <div class="alert-card {card_class}">
             <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -615,12 +773,13 @@ else:
                     <span class="alert-ticker">{alert.get('ticker','')}</span>
                     <span style="color:{opt_color}; font-family:monospace; font-size:0.8rem; margin-left:8px;">{opt_label}</span>
                     <span class="alert-contract"> ${alert.get('strike','')} | {alert.get('expiry','')}</span>
+                    {mode_badge}
                 </div>
                 <span class="{tag_class}">{signal_label}</span>
             </div>
             <div class="alert-meta" style="margin-top:0.5rem;">
                 成交量 <b style="color:#e0e0f0">{format_volume(alert.get('volume',0))}</b>
-                &nbsp;|&nbsp; 基準×<b style="color:#ffcc00">{alert.get('vol_ratio',0):.1f}</b>倍
+                &nbsp;|&nbsp; {ratio_html}
                 &nbsp;|&nbsp; OI {format_volume(alert.get('oi',0))}
                 &nbsp;|&nbsp; 最後 <b style="color:#e0e0f0">${alert.get('last_price',0):.2f}</b>
                 &nbsp;|&nbsp; IV {alert.get('iv',0):.1f}%
@@ -635,6 +794,6 @@ else:
 st.markdown("---")
 st.markdown("""
 <div style="font-size:0.7rem; color:#333355; font-family:monospace; text-align:center;">
-期權異動監控系統 v1.0 &nbsp;|&nbsp; 數據來源：Yahoo Finance（15-20分鐘延遲）&nbsp;|&nbsp; 僅供參考，非投資建議
+期權異動監控系統 v1.1 &nbsp;|&nbsp; 數據來源：Yahoo Finance（15-20分鐘延遲）&nbsp;|&nbsp; 僅供參考，非投資建議
 </div>
 """, unsafe_allow_html=True)
